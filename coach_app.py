@@ -214,7 +214,6 @@ if len(st.session_state.selected_lineup_names) > 0:
     with head_col1:
         st.title("📊 Multi-Line Overlay Analysis")
     with head_col2:
-        # Fixed: Inline execution state reset forces the widget keys to mutate, killing cache tracking loops instantly
         if st.button("🔄 RETURN TO LIVE STREAM", type="primary", use_container_width=True, key=f"ret_live_btn_v{global_state.archive_version}"):
             st.session_state.selected_lineup_names = []
             global_state.archive_version += 1
