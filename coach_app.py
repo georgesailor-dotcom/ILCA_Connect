@@ -10,6 +10,32 @@ import altair as alt
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Live GG", layout="wide")
 
+# --- PASSWORD GATE LAYER ---
+def check_password():
+    """Returns True if the user entered the correct password."""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    # Render a clean, non-intrusive terminal login box
+    st.title("🔒 Live GG - Secure Access")
+    user_password = st.text_input("Enter Coach Access Password:", type="password")
+    
+    if user_password == "214137": 
+        st.session_state.authenticated = True
+        st.rerun()
+    elif user_password:
+        st.error("❌ Invalid Password")
+        
+    return False
+
+# Halt entire script thread execution right here if locked
+if not check_password():
+    st.stop()
+
+
 # --- GLOBAL CROSS-SESSION MEMORY CACHE ---
 class GlobalAppState:
     """Explicitly bypasses user session isolation to link all connected devices together."""
@@ -217,136 +243,3 @@ if len(st.session_state.selected_lineup_names) > 0:
             color=alt.Color('LineUp:N', title="Traces", scale=alt.Scale(scheme='category10'))
         ).properties(width='container', height=300).interactive()
         st.altair_chart(sog_chart, use_container_width=True)
-
-    if show_hr:
-        st.markdown("### Physical Exertion Overlay (HR)")
-        hr_chart = alt.Chart(df_compare).mark_line(strokeWidth=3).encode(
-            x=alt.X('run_seconds:Q', title="Elapsed Duration (Seconds)"),
-            y=alt.Y('bpm_smooth:Q', title="Heart Rate (BPM)", scale=alt.Scale(zero=False)),
-            color=alt.Color('LineUp:N', title="Traces", scale=alt.Scale(scheme='category10'))
-        ).properties(width='container', height=250).interactive()
-        st.altair_chart(hr_chart, use_container_width=True)
-
-    if show_cog:
-        st.markdown("### Course Over Ground Overlay (COG)")
-        cog_chart = alt.Chart(df_compare).mark_line(strokeWidth=3).encode(
-            x=alt.X('run_seconds:Q', title="Elapsed Duration (Seconds)"),
-            y=alt.Y('hdg_smooth:Q', title="Heading Degrees (°)", scale=alt.Scale(zero=False)),
-            color=alt.Color('LineUp:N', title="Traces", scale=alt.Scale(scheme='category10'))
-        ).properties(width='container', height=250).interactive()
-        st.altair_chart(cog_chart, use_container_width=True)
-
-# =========================================================
-#  MODE B: REAL-TIME 5Hz PERFORMANCE STREAM INTERFACE
-# =========================================================
-else:
-    st.title("Live GG")
-    st.markdown("### Line Up Recorder")
-    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 2])
-
-    if global_state.active_lineup_start_time is None:
-        st.button("🟢 START LINE-UP", on_click=cb_start_lineup, use_container_width=True, key=f"start_btn_v{global_state.archive_version}")
-    else:
-        st.button("🔴 END LINE-UP", on_click=cb_end_lineup, use_container_width=True, key=f"end_btn_v{global_state.archive_version}")
-
-        elapsed = time.time() - global_state.active_lineup_start_time
-        ctrl_col3.markdown(f"<div style='background-color:#1E293B; padding:10px; border-radius:5px; border-left: 4px solid #00FF00; color:#FFFFFF;'>⏱️ <b>Line-up Active:</b> {elapsed:.1f}s elapsed</div>", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    if current_packet is None or global_state.history_df.empty:
-        st.info("Awaiting live stream telemetry array...")
-    else:
-        filtered_df = global_state.history_df.tail(display_records).copy()
-        total_rows = len(filtered_df)
-        filtered_df["seconds_ago"] = [(-total_rows + 1 + i) * 0.2 for i in range(total_rows)]
-        
-        latest_record = filtered_df.iloc[-1]
-
-        def build_sog_chart(df):
-            series_raw = df["knots"].astype(float)
-            window_avg = float(series_raw.mean())
-            window_min = float(series_raw.min())
-            window_max = float(series_raw.max())
-            
-            df_smooth = df.copy()
-            df_smooth["knots"] = df_smooth["knots"].rolling(window=10, min_periods=1).mean()
-
-            max_deviation = max(abs(window_max - window_avg), abs(window_avg - window_min))
-            padding = max_deviation * 0.10 if max_deviation > 0 else 0.5
-            y_scale_min = max(0.0, window_avg - max_deviation - padding)
-            y_scale_max = window_avg + max_deviation + padding
-
-            df_segments = df_smooth.copy()
-            df_segments['next_seconds_ago'] = df_segments['seconds_ago'].shift(-1)
-            df_segments['next_knots'] = df_segments['knots'].shift(-1)
-            df_segments = df_segments.dropna(subset=['next_seconds_ago', 'next_knots'])
-            df_segments['segment_avg'] = (df_segments['knots'] + df_segments['next_knots']) / 2.0
-
-            chart = alt.Chart(df_segments).mark_line(clip=True, strokeWidth=4).encode(
-                x=alt.X('seconds_ago:Q', title=None, axis=alt.Axis(labels=False, ticks=False)),
-                x2='next_seconds_ago:Q',
-                y=alt.Y('knots:Q', title=None, scale=alt.Scale(domain=[y_scale_min, y_scale_max]),
-                        axis=alt.Axis(values=[window_min, window_max], format=".2f", labelFontSize=18, labelFontWeight="bold")),
-                y2='next_knots:Q',
-                color=alt.condition(alt.datum.segment_avg >= window_avg, alt.value("#00FF00"), alt.value("#FF0000"))
-            ).properties(width='container', height=200)
-            return chart
-
-        def build_standard_chart(df, y_column, hex_color, is_integer=False):
-            series_raw = df[y_column].astype(float)
-            window_min = float(series_raw.min())
-            window_max = float(series_raw.max())
-            
-            df_smooth = df.copy()
-            df_smooth[y_column] = df_smooth[y_column].rolling(window=10, min_periods=1).mean()
-
-            delta = window_max - window_min
-            padding = delta * 0.08 if delta > 0 else 1.0
-            y_scale_min = max(0.0, window_min - padding)
-            y_scale_max = window_max + padding
-
-            chart = alt.Chart(df_smooth).mark_line(clip=True, strokeWidth=3).encode(
-                x=alt.X('seconds_ago:Q', title=None, axis=alt.Axis(labels=False, ticks=False)),
-                y=alt.Y(f'{y_column}:Q', title=None, scale=alt.Scale(domain=[y_scale_min, y_scale_max]),
-                        axis=alt.Axis(values=[window_min, window_max], format=".2f" if not is_integer else ".0f", labelFontSize=18, labelFontWeight="bold")),
-                color=alt.value(hex_color)
-            ).properties(width='container', height=200)
-            return chart
-
-        if show_speed:
-            c1, c2 = st.columns([1, 4], gap="medium")
-            with c1:
-                live_sog = float(latest_record['knots'])
-                st.markdown("<div style='padding-top: 55px; text-align: left;'>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='font-size: 64px; color: #00FF00; margin: 0px; font-weight: bold;'>{live_sog:.2f} <span style='font-size: 24px;'>kts</span></h1>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with c2:
-                st.altair_chart(build_sog_chart(filtered_df), use_container_width=True)
-            st.markdown("<hr style='margin-top:10px; margin-bottom:10px;'/>", unsafe_allow_html=True)
-
-        if show_hr:
-            c1, c2 = st.columns([1, 4], gap="medium")
-            with c1:
-                live_hr = int(latest_record['bpm'])
-                hr_text = f"{live_hr}" if live_hr > 0 else "STBY"
-                st.markdown("<div style='padding-top: 55px; text-align: left;'>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='font-size: 64px; color: #FF0000; margin: 0px; font-weight: bold;'>{hr_text} <span style='font-size: 24px;'>BPM</span></h1>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with c2:
-                st.altair_chart(build_standard_chart(filtered_df, "bpm", "#FF0000", is_integer=True), use_container_width=True)
-            st.markdown("<hr style='margin-top:10px; margin-bottom:10px;'/>", unsafe_allow_html=True)
-
-        if show_cog:
-            c1, c2 = st.columns([1, 4], gap="medium")
-            with c1:
-                live_cog = float(latest_record['hdg'])
-                st.markdown("<div style='padding-top: 55px; text-align: left;'>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='font-size: 64px; color: #000000; margin: 0px; font-weight: bold;'>{live_cog:.0f}°</h1>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with c2:
-                st.altair_chart(build_standard_chart(filtered_df, "hdg", "#000000", is_integer=True), use_container_width=True)
-
-# 5Hz refresh rate execution lock
-time.sleep(0.2)
-st.rerun()
