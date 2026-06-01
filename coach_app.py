@@ -125,9 +125,6 @@ def cb_end_lineup():
         
     global_state.active_lineup_start_time = None
 
-def cb_return_live():
-    st.session_state.selected_lineup_names = []
-
 def cb_clear_all_archives():
     global_state.lineups_archive = []
     global_state.active_lineup_start_time = None
@@ -217,7 +214,11 @@ if len(st.session_state.selected_lineup_names) > 0:
     with head_col1:
         st.title("📊 Multi-Line Overlay Analysis")
     with head_col2:
-        st.button("🔄 RETURN TO LIVE STREAM", type="primary", on_click=cb_return_live, use_container_width=True, key="ret_live_debrief_btn")
+        # Fixed: Inline execution state reset forces the widget keys to mutate, killing cache tracking loops instantly
+        if st.button("🔄 RETURN TO LIVE STREAM", type="primary", use_container_width=True, key=f"ret_live_btn_v{global_state.archive_version}"):
+            st.session_state.selected_lineup_names = []
+            global_state.archive_version += 1
+            st.rerun()
 
     stat_cols = st.columns(len(target_runs))
     for i, run in enumerate(target_runs):
