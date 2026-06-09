@@ -1,382 +1,109 @@
 import streamlit as st
-import pandas as pd
 import paho.mqtt.client as mqtt
 import json
-import os
 import time
-import math
-import altair as alt
+import pandas as pd
+from collections import deque
+from datetime import datetime
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Live GG", layout="wide")
+# ── MQTT Config ──────────────────────────────────────────
+MQTT_BROKER = "145.241.230.146"   # Oracle Cloud VM
+MQTT_PORT   = 1883                 # Plain TCP - no TLS
+MQTT_TOPIC  = "boat/target/telemetry"
+# No username/password needed - anonymous allowed
 
-# --- PASSWORD GATE LAYER ---
-def check_password():
-    """Returns True if the user entered the correct password via form submit."""
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
+# ── State ────────────────────────────────────────────────
+MAX_POINTS = 300  # 60 seconds at 5Hz
 
-    if st.session_state.authenticated:
-        return True
+if "telemetry" not in st.session_state:
+    st.session_state.telemetry = deque(maxlen=MAX_POINTS)
+if "connected" not in st.session_state:
+    st.session_state.connected = False
+if "last_msg" not in st.session_state:
+    st.session_state.last_msg = None
 
-    # Render a clean touch-friendly mobile form
-    st.title("🔒 Live GG - Secure Access")
-    
-    with st.form("login_form", clear_on_submit=False):
-        user_password = st.text_input("Enter Coach Access Password:", type="password")
-        submit_button = st.form_submit_button("🔓 UNLOCK DASHBOARD", use_container_width=True)
-        
-        if submit_button:
-            if user_password == "214137": 
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("❌ Invalid Password")
-        
-    return False
+# ── MQTT Callbacks ────────────────────────────────────────
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        st.session_state.connected = True
+        client.subscribe(MQTT_TOPIC)
+        print(f"[MQTT] Connected and subscribed to {MQTT_TOPIC}")
+    else:
+        print(f"[MQTT] Connection failed rc={rc}")
 
-# Halt entire script thread execution right here if locked
-if not check_password():
-    st.stop()
+def on_disconnect(client, userdata, rc, properties=None, reasonCode=None):
+    st.session_state.connected = False
+    print("[MQTT] Disconnected")
 
+def on_message(client, userdata, msg):
+    try:
+        data = json.loads(msg.payload.decode())
+        data["time"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        st.session_state.telemetry.append(data)
+        st.session_state.last_msg = data
+    except Exception as e:
+        print(f"[MQTT] Parse error: {e}")
 
-# --- GLOBAL CROSS-SESSION MEMORY CACHE ---
-class GlobalAppState:
-    """Explicitly bypasses user session isolation to link all connected devices together."""
-    def __init__(self):
-        self.history_df = pd.DataFrame(columns=["knots", "bpm", "lat", "lon", "sats", "hdg", "timestamp"])
-        self.lineups_archive = []
-        self.active_lineup_start_time = None
-        self.archive_version = 0
-
+# ── MQTT Client (singleton per session) ──────────────────
 @st.cache_resource
-def get_global_state():
-    return GlobalAppState()
-
-# Initialize the synchronized server-wide memory pool
-global_state = get_global_state()
-
-# --- MQTT CONFIGURATION ---
-MQTT_BROKER = "0445b00fffc949f59fd08b2d728b1989.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USER = "ILCA_BOAT"
-MQTT_PASSWORD = "Nzl214137"
-MQTT_TOPIC = "boat/target/telemetry"
-
-# --- GLOBAL SINGLETON NETWORK CONNECTION ---
-@st.cache_resource
-def initialize_global_mqtt():
-    def on_connect_cb(client, userdata, flags, rc, properties=None):
-        if rc == 0:
-            client.subscribe(MQTT_TOPIC)
-    def on_message_cb(client, userdata, msg):
-        try:
-            with open("live_telemetry.txt", "w") as f:
-                f.write(msg.payload.decode())
-        except Exception:
-            pass
-
+def get_mqtt_client():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-    client.tls_set()
-    client.on_connect = on_connect_cb
-    client.on_message = on_message_cb
+    client.on_connect    = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message    = on_message
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_start() 
+    client.loop_start()
     return client
 
-mqtt_engine = initialize_global_mqtt()
+client = get_mqtt_client()
 
-# --- USER-SESSION SPECIFIC VIEWER STATE ---
-if "selected_lineup_names" not in st.session_state:
-    st.session_state.selected_lineup_names = []  
+# ── UI ────────────────────────────────────────────────────
+st.set_page_config(page_title="Sailing Coach", layout="wide", page_icon="⛵")
+st.title("⛵ Sailing Coach Telemetry")
 
-def calculate_cog(lat1, lon1, lat2, lon2):
-    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
-    diffLong = math.radians(lon2 - lon1)
-    x = math.sin(diffLong) * math.cos(rlat2)
-    y = math.cos(rlat1) * math.sin(rlat2) - (math.sin(rlat1) * math.cos(rlat2) * math.cos(diffLong))
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
-
-# --- CALLBACK ENGINES LINKED TO GLOBAL CACHE ---
-def cb_start_lineup():
-    global_state.active_lineup_start_time = time.time()
-
-def cb_end_lineup():
-    start_t = global_state.active_lineup_start_time
-    end_t = time.time()
-    
-    full_history = global_state.history_df.copy()
-    lineup_slice = full_history[(full_history["timestamp"] >= start_t) & (full_history["timestamp"] <= end_t)].copy()
-    
-    if len(lineup_slice) > 3:
-        lineup_slice["run_seconds"] = [i * 0.2 for i in range(len(lineup_slice))]
-        lineup_id = len(global_state.lineups_archive) + 1
-        
-        archive_payload = {
-            "id": f"run_{int(start_t)}_{lineup_id}_v{global_state.archive_version}", 
-            "name": f"Line-Up #{lineup_id} ({time.strftime('%H:%M:%S', time.localtime(start_t))})",
-            "df": lineup_slice,
-            "avg_sog": lineup_slice["knots"].astype(float).mean(),
-            "max_sog": lineup_slice["knots"].astype(float).max(),
-            "avg_hr": lineup_slice["bpm"].astype(float).mean()
-        }
-        global_state.lineups_archive.append(archive_payload)
-        
-    global_state.active_lineup_start_time = None
-
-def cb_clear_all_archives():
-    global_state.lineups_archive = []
-    global_state.active_lineup_start_time = None
-    st.session_state.selected_lineup_names = []
-    global_state.archive_version += 1 
-    st.rerun()
-
-# --- SIDEBAR CONTROL PANEL ---
-st.sidebar.header("Chart Visibility")
-show_speed = st.sidebar.checkbox("SOG", value=True)
-show_hr = st.sidebar.checkbox("HR", value=True)
-show_cog = st.sidebar.checkbox("COG", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.header("Time Window Config")
-time_window = st.sidebar.selectbox("Select History Scale", options=["20s", "1m", "2m", "3m", "5m"], index=1)
-
-window_map = {"20s": 20 * 5, "1m": 60 * 5, "2m": 120 * 5, "3m": 180 * 5, "5m": 300 * 5}
-display_records = window_map[time_window]
-
-# --- REFRESH INGESTION PIPELINE ---
-current_packet = None
-if os.path.exists("live_telemetry.txt"):
-    try:
-        with open("live_telemetry.txt", "r") as f:
-            raw_string = f.read()
-        current_packet = json.loads(raw_string)
-        
-        if "last_processed_packet" not in st.session_state or st.session_state.last_processed_packet != raw_string:
-            st.session_state.last_processed_packet = raw_string
-            df_hist = global_state.history_df
-            calculated_hdg = 0.0
-            
-            if not df_hist.empty:
-                last_entry = df_hist.iloc[-1]
-                calculated_hdg = last_entry.get("hdg", 0.0)
-                
-                if current_packet.get("knots", 0.0) > 0.4:
-                    lat1, lon1 = float(last_entry["lat"]), float(last_entry["lon"])
-                    lat2, lon2 = float(current_packet["lat"]), float(current_packet["lon"])
-                    if lat1 != lat2 or lon1 != lon2:
-                        calculated_hdg = calculate_cog(lat1, lon1, lat2, lon2)
-            
-            current_packet["hdg"] = calculated_hdg
-            current_packet["timestamp"] = time.time()
-            
-            new_row = pd.DataFrame([current_packet])
-            global_state.history_df = pd.concat([df_hist, new_row], ignore_index=True).iloc[-4000:] 
-    except Exception:
-        pass
-
-# --- SIDEBAR MULTI-COMPARE INTERFACE CONTAINER ---
-sidebar_container = st.sidebar.empty()
-
-if len(global_state.lineups_archive) > 0:
-    with sidebar_container.container():
-        st.markdown("---")
-        st.header("📦 Compare Line-Ups")
-        
-        available_names = [item["name"] for item in global_state.lineups_archive]
-        
-        st.session_state.selected_lineup_names = st.multiselect(
-            "Select traces to overlay:",
-            options=available_names,
-            default=[name for name in st.session_state.selected_lineup_names if name in available_names],
-            key=f"compare_select_v{global_state.archive_version}"
-        )
-                
-        st.markdown("---")
-        st.button(
-            "🗑️ CLEAR ALL ARCHIVES", 
-            key=f"clear_btn_v{global_state.archive_version}", 
-            type="secondary", 
-            on_click=cb_clear_all_archives, 
-            use_container_width=True
-        )
-else:
-    sidebar_container.empty()
-
-# =========================================================
-#  MODE A: FULL SCREEN MULTI-LINE OVERLAY COMPARISON VIEW
-# =========================================================
-if len(st.session_state.selected_lineup_names) > 0:
-    target_runs = [item for item in global_state.lineups_archive if item["name"] in st.session_state.selected_lineup_names]
-    
-    head_col1, head_col2 = st.columns([3, 1])
-    with head_col1:
-        st.title("📊 Multi-Line Overlay Analysis")
-    with head_col2:
-        if st.button("🔄 RETURN TO LIVE STREAM", type="primary", use_container_width=True, key=f"ret_live_btn_v{global_state.archive_version}"):
-            st.session_state.selected_lineup_names = []
-            global_state.archive_version += 1
-            st.rerun()
-
-    stat_cols = st.columns(len(target_runs))
-    for i, run in enumerate(target_runs):
-        with stat_cols[i]:
-            st.markdown(f"**{run['name']}**")
-            st.markdown(f"Avg Speed: `{run['avg_sog']:.2f} kts` | Peak: `{run['max_sog']:.2f} kts` | Exertion: `{run['avg_hr']:.0f} BPM`")
-    st.markdown("---")
-
-    combined_list = []
-    for run in target_runs:
-        df_temp = run["df"].copy()
-        df_temp["LineUp"] = run["name"]
-        
-        df_temp["knots_smooth"] = df_temp["knots"].astype(float).rolling(window=10, min_periods=1).mean()
-        df_temp["bpm_smooth"] = df_temp["bpm"].astype(float).rolling(window=10, min_periods=1).mean()
-        df_temp["hdg_smooth"] = df_temp["hdg"].astype(float).rolling(window=10, min_periods=1).mean()
-        
-        combined_list.append(df_temp)
-    
-    df_compare = pd.concat(combined_list, ignore_index=True)
-
-    if show_speed:
-        st.markdown("### Speed Comparison Overlay (SOG)")
-        sog_chart = alt.Chart(df_compare).mark_line(strokeWidth=3).encode(
-            x=alt.X('run_seconds:Q', title="Elapsed Duration (Seconds)"),
-            y=alt.Y('knots_smooth:Q', title="Knots (Smoothed)", scale=alt.Scale(zero=False)),
-            color=alt.Color('LineUp:N', title="Traces", scale=alt.Scale(scheme='category10'))
-        ).properties(width='container', height=300).interactive()
-        st.altair_chart(sog_chart, use_container_width=True)
-
-    if show_hr:
-        st.markdown("### Physical Exertion Overlay (HR)")
-        hr_chart = alt.Chart(df_compare).mark_line(strokeWidth=3).encode(
-            x=alt.X('run_seconds:Q', title="Elapsed Duration (Seconds)"),
-            y=alt.Y('bpm_smooth:Q', title="Heart Rate (BPM)", scale=alt.Scale(zero=False)),
-            color=alt.Color('LineUp:N', title="Traces", scale=alt.Scale(scheme='category10'))
-        ).properties(width='container', height=250).interactive()
-        st.altair_chart(hr_chart, use_container_width=True)
-
-    if show_cog:
-        st.markdown("### Course Over Ground Overlay (COG)")
-        cog_chart = alt.Chart(df_compare).mark_line(strokeWidth=3).encode(
-            x=alt.X('run_seconds:Q', title="Elapsed Duration (Seconds)"),
-            y=alt.Y('hdg_smooth:Q', title="Heading Degrees (°)", scale=alt.Scale(zero=False)),
-            color=alt.Color('LineUp:N', title="Traces", scale=alt.Scale(scheme='category10'))
-        ).properties(width='container', height=250).interactive()
-        st.altair_chart(cog_chart, use_container_width=True)
-
-# =========================================================
-#  MODE B: REAL-TIME 5Hz PERFORMANCE STREAM INTERFACE
-# =========================================================
-else:
-    st.title("Live GG")
-    st.markdown("### Line Up Recorder")
-    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 2])
-
-    if global_state.active_lineup_start_time is None:
-        st.button("🟢 START LINE-UP", on_click=cb_start_lineup, use_container_width=True, key=f"start_btn_v{global_state.archive_version}")
+status_col, refresh_col = st.columns([3, 1])
+with status_col:
+    if st.session_state.connected:
+        st.success(f"🟢 Connected to {MQTT_BROKER}:{MQTT_PORT}")
     else:
-        st.button("🔴 END LINE-UP", on_click=cb_end_lineup, use_container_width=True, key=f"end_btn_v{global_state.archive_version}")
+        st.error("🔴 Disconnected from broker")
 
-        elapsed = time.time() - global_state.active_lineup_start_time
-        ctrl_col3.markdown(f"<div style='background-color:#1E293B; padding:10px; border-radius:5px; border-left: 4px solid #00FF00; color:#FFFFFF;'>⏱️ <b>Line-up Active:</b> {elapsed:.1f}s elapsed</div>", unsafe_allow_html=True)
+with refresh_col:
+    if st.button("🔄 Refresh"):
+        st.rerun()
 
-    st.markdown("---")
+# ── Latest Values ─────────────────────────────────────────
+if st.session_state.last_msg:
+    d = st.session_state.last_msg
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🚤 Speed (knots)", f"{d.get('knots', 0):.2f}")
+    c2.metric("❤️ Heart Rate",    f"{d.get('bpm', 0)} bpm")
+    c3.metric("🛰️ Satellites",    d.get('sats', 0))
+    c4.metric("📍 Position",      f"{d.get('lat', 0):.5f}, {d.get('lon', 0):.5f}")
+else:
+    st.info("⏳ Waiting for data from boat...")
 
-    if current_packet is None or global_state.history_df.empty:
-        st.info("Awaiting live stream telemetry array...")
-    else:
-        filtered_df = global_state.history_df.tail(display_records).copy()
-        total_rows = len(filtered_df)
-        filtered_df["seconds_ago"] = [(-total_rows + 1 + i) * 0.2 for i in range(total_rows)]
-        
-        latest_record = filtered_df.iloc[-1]
+# ── Charts ────────────────────────────────────────────────
+if st.session_state.telemetry:
+    df = pd.DataFrame(list(st.session_state.telemetry))
 
-        def build_sog_chart(df):
-            series_raw = df["knots"].astype(float)
-            window_avg = float(series_raw.mean())
-            window_min = float(series_raw.min())
-            window_max = float(series_raw.max())
-            
-            df_smooth = df.copy()
-            df_smooth["knots"] = df_smooth["knots"].rolling(window=10, min_periods=1).mean()
+    col1, col2 = st.columns(2)
 
-            max_deviation = max(abs(window_max - window_avg), abs(window_avg - window_min))
-            padding = max_deviation * 0.10 if max_deviation > 0 else 0.5
-            y_scale_min = max(0.0, window_avg - max_deviation - padding)
-            y_scale_max = window_avg + max_deviation + padding
+    with col1:
+        st.subheader("Speed (knots)")
+        st.line_chart(df.set_index("time")["knots"] if "time" in df else df["knots"])
 
-            df_segments = df_smooth.copy()
-            df_segments['next_seconds_ago'] = df_segments['seconds_ago'].shift(-1)
-            df_segments['next_knots'] = df_segments['knots'].shift(-1)
-            df_segments = df_segments.dropna(subset=['next_seconds_ago', 'next_knots'])
-            df_segments['segment_avg'] = (df_segments['knots'] + df_segments['next_knots']) / 2.0
+    with col2:
+        st.subheader("Heart Rate (bpm)")
+        if "bpm" in df.columns:
+            st.line_chart(df.set_index("time")["bpm"] if "time" in df else df["bpm"])
 
-            chart = alt.Chart(df_segments).mark_line(clip=True, strokeWidth=4).encode(
-                x=alt.X('seconds_ago:Q', title=None, axis=alt.Axis(labels=False, ticks=False)),
-                x2='next_seconds_ago:Q',
-                y=alt.Y('knots:Q', title=None, scale=alt.Scale(domain=[y_scale_min, y_scale_max]),
-                        axis=alt.Axis(values=[window_min, window_max], format=".2f", labelFontSize=18, labelFontWeight="bold")),
-                y2='next_knots:Q',
-                color=alt.condition(alt.datum.segment_avg >= window_avg, alt.value("#00FF00"), alt.value("#FF0000"))
-            ).properties(width='container', height=200)
-            return chart
+# ── Raw Data ──────────────────────────────────────────────
+with st.expander("Raw telemetry (last 20 messages)"):
+    if st.session_state.telemetry:
+        recent = list(st.session_state.telemetry)[-20:]
+        st.dataframe(pd.DataFrame(recent), use_container_width=True)
 
-        def build_standard_chart(df, y_column, hex_color, is_integer=False):
-            series_raw = df[y_column].astype(float)
-            window_min = float(series_raw.min())
-            window_max = float(series_raw.max())
-            
-            df_smooth = df.copy()
-            df_smooth[y_column] = df_smooth[y_column].rolling(window=10, min_periods=1).mean()
-
-            delta = window_max - window_min
-            padding = delta * 0.08 if delta > 0 else 1.0
-            y_scale_min = max(0.0, window_min - padding)
-            y_scale_max = window_max + padding
-
-            chart = alt.Chart(df_smooth).mark_line(clip=True, strokeWidth=3).encode(
-                x=alt.X('seconds_ago:Q', title=None, axis=alt.Axis(labels=False, ticks=False)),
-                y=alt.Y(f'{y_column}:Q', title=None, scale=alt.Scale(domain=[y_scale_min, y_scale_max]),
-                        axis=alt.Axis(values=[window_min, window_max], format=".2f" if not is_integer else ".0f", labelFontSize=18, labelFontWeight="bold")),
-                color=alt.value(hex_color)
-            ).properties(width='container', height=200)
-            return chart
-
-        if show_speed:
-            c1, c2 = st.columns([1, 4], gap="medium")
-            with c1:
-                live_sog = float(latest_record['knots'])
-                st.markdown("<div style='padding-top: 55px; text-align: left;'>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='font-size: 64px; color: #00FF00; margin: 0px; font-weight: bold;'>{live_sog:.2f} <span style='font-size: 24px;'>kts</span></h1>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with c2:
-                st.altair_chart(build_sog_chart(filtered_df), use_container_width=True)
-            st.markdown("<hr style='margin-top:10px; margin-bottom:10px;'/>", unsafe_allow_html=True)
-
-        if show_hr:
-            c1, c2 = st.columns([1, 4], gap="medium")
-            with c1:
-                live_hr = int(latest_record['bpm'])
-                hr_text = f"{live_hr}" if live_hr > 0 else "STBY"
-                st.markdown("<div style='padding-top: 55px; text-align: left;'>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='font-size: 64px; color: #FF0000; margin: 0px; font-weight: bold;'>{hr_text} <span style='font-size: 24px;'>BPM</span></h1>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with c2:
-                st.altair_chart(build_standard_chart(filtered_df, "bpm", "#FF0000", is_integer=True), use_container_width=True)
-            st.markdown("<hr style='margin-top:10px; margin-bottom:10px;'/>", unsafe_allow_html=True)
-
-        if show_cog:
-            c1, c2 = st.columns([1, 4], gap="medium")
-            with c1:
-                live_cog = float(latest_record['hdg'])
-                st.markdown("<div style='padding-top: 55px; text-align: left;'>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='font-size: 64px; color: #000000; margin: 0px; font-weight: bold;'>{live_cog:.0f}°</h1>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with c2:
-                st.altair_chart(build_standard_chart(filtered_df, "hdg", "#000000", is_integer=True), use_container_width=True)
-
-# 5Hz refresh rate execution lock
+# ── Auto-refresh every 200ms ──────────────────────────────
 time.sleep(0.2)
 st.rerun()
