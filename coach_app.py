@@ -8,7 +8,7 @@ from datetime import datetime
 
 # ── MQTT Config ──────────────────────────────────────────
 MQTT_BROKER = "145.241.230.146"   # Oracle Cloud VM
-MQTT_PORT   = 9001                 # WebSockets port
+MQTT_PORT   = 1883                 # Plain TCP
 MQTT_TOPIC  = "boat/target/telemetry"
 
 # ── State ────────────────────────────────────────────────
@@ -46,7 +46,7 @@ def on_message(client, userdata, msg):
 # ── MQTT Client (singleton per session) ──────────────────
 @st.cache_resource
 def get_mqtt_client():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
     client.on_message    = on_message
@@ -62,7 +62,8 @@ st.title("⛵ Sailing Coach Telemetry")
 
 status_col, refresh_col = st.columns([3, 1])
 with status_col:
-    if st.session_state.connected:
+    # Show connected if client is alive (thread issue means session_state may lag)
+    if client.is_connected():
         st.success(f"🟢 Connected to {MQTT_BROKER}:{MQTT_PORT}")
     else:
         st.error("🔴 Disconnected from broker")
