@@ -8,9 +8,8 @@ from datetime import datetime
 
 # ── MQTT Config ──────────────────────────────────────────
 MQTT_BROKER = "145.241.230.146"   # Oracle Cloud VM
-MQTT_PORT   = 1883                 # Plain TCP - no TLS
+MQTT_PORT   = 9001                 # WebSockets port
 MQTT_TOPIC  = "boat/target/telemetry"
-# No username/password needed - anonymous allowed
 
 # ── State ────────────────────────────────────────────────
 MAX_POINTS = 300  # 60 seconds at 5Hz
@@ -47,7 +46,7 @@ def on_message(client, userdata, msg):
 # ── MQTT Client (singleton per session) ──────────────────
 @st.cache_resource
 def get_mqtt_client():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
     client.on_message    = on_message
